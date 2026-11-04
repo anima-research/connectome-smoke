@@ -85,9 +85,10 @@ lanes' shared helpers, as the *unit tests* workflow does on every push to
 - `npm install` fails → the published set is un-installable (a dep range
   points at nothing, a postinstall breaks, a native binary is missing).
 - `bun meets the host's floor` fails → the lanes' Bun is below the
-  `engines.bun` of the host they test, and the host isn't broken: raise both
-  `setup-bun` steps in `.github/workflows/smoke.yml` (run locally, put a Bun
-  at or above the floor first on `PATH`). Or the check couldn't read the
+  `engines.bun` of the host they test, and the host isn't broken: raise the
+  `floor` runtime's `bun` in `RUNTIMES`, in `.github/workflows/smoke.yml`,
+  which sets each leg's Bun (run locally, put a Bun at or above the floor
+  first on `PATH`). Or the check couldn't read the
   floor or the Bun version, and its message says which and where to look.
 - `typecheck published host src` fails → the host ships source that does
   not compile against the `.d.ts` its own dependency ranges resolve to.
