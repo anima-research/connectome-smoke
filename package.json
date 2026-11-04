@@ -11,5 +11,5 @@
     "smoke:source": "node lanes/source.mjs",
     "manifest": "node scripts/manifest.mjs"
   },
-  "engines": { "node": ">=20" }
+  "engines": { "node": ">=22.12" }
 }

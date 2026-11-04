@@ -23,7 +23,7 @@ IPC event stream as artifacts.
 
 ## Run locally
 
-Needs node ≥ 20, npm, bun (the host runs under bun), git.
+Needs node ≥ 22.12, npm, bun ≥ 1.4.3 (the floors connectome-host declares in `engines`; the host runs under bun), git. Each lane checks its Bun against the floor the host it tests declares, and fails, naming both, when it's below.
 
 ```sh
 node lanes/published.mjs                       # consumer view
@@ -52,6 +52,11 @@ Exit 0 = pass.
 
 - `npm install` fails → the published set is un-installable (a dep range
   points at nothing, a postinstall breaks, a native binary is missing).
+- `bun meets the host's floor` fails → the lanes' Bun is below the
+  `engines.bun` of the host they test, and the host isn't broken: raise both
+  `setup-bun` steps in `.github/workflows/smoke.yml` (run locally, put a Bun
+  at or above the floor first on `PATH`). Or the check couldn't read the
+  floor or the Bun version, and its message says which and where to look.
 - `typecheck published host src` fails → the host ships source that does
   not compile against the `.d.ts` its own dependency ranges resolve to.
 - `boot #1` fails → the stack does not take a turn; the step detail carries
