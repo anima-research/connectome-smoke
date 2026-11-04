@@ -21,7 +21,7 @@
 import { mkdtempSync, mkdirSync, existsSync, rmSync, symlinkSync, readdirSync, readFileSync, lstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { makeReport, sh, bootTwice, finish, parseArgs, failureLines } from '../lib/common.mjs';
+import { makeReport, sh, bootTwice, finish, parseArgs, failureLines, bunMeetsHostFloor } from '../lib/common.mjs';
 import { REPOS, repoUrl } from '../lib/repos.mjs';
 
 const { opt } = parseArgs(process.argv.slice(2));
@@ -78,6 +78,16 @@ function testSummary(r) {
     return lines.join('\n    ');
   });
   if (!cloneOk) return done();
+
+  // Whenever this run tests the host: a host it cloned without a package.json
+  // fails the step, as the published lane's does.
+  if (!ONLY || ONLY.includes('connectome-host')) {
+    await step("bun meets the host's floor", () => {
+      const said = bunMeetsHostFloor(join(SRC, 'connectome-host', 'package.json'), report.bun);
+      log(said);
+      return said;
+    });
+  }
 
   // -- 2. per-repo, as its own CI would --
   for (const r of REPOS) {
