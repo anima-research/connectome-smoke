@@ -9,7 +9,8 @@
     "smoke:published": "node lanes/published.mjs --lane published",
     "smoke:latest": "node lanes/published.mjs --lane latest",
     "smoke:source": "node lanes/source.mjs",
-    "manifest": "node scripts/manifest.mjs"
+    "manifest": "node scripts/manifest.mjs",
+    "test": "node --test scripts/notify.test.mjs scripts/manifest.test.mjs lib/common.test.mjs"
   },
-  "engines": { "node": ">=22.12" }
+  "engines": { "node": ">=22.12.0" }
 }
