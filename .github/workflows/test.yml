@@ -1,0 +1,28 @@
+name: unit tests
+
+# The notifier's, the registry manifest's and the lanes' shared helpers'
+# tests (npm test), on every push to main and every pull request, on the
+# Node floor and the newest Node.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: npm test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.12.0', 'latest']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm test

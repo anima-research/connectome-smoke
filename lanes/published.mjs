@@ -22,14 +22,16 @@
  *         --lane latest      every @animalabs/* pinned to its `latest` tag via
  *                            npm overrides — "is newest-of-everything coherent?"
  *
- * Zero dependencies. Needs node >= 20, bun (the host runs under bun), npm.
+ * Zero dependencies. Needs node >= 22.12, bun >= 1.4.3 (the floors connectome-host
+ * declares in `engines`; the host runs under bun), npm. Checks its Bun against
+ * the floor the host it installs declares, and fails, naming both, below it.
  * Exit 0 pass / 1 fail. Writes --report (JSON) and --summary (markdown).
  */
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { makeReport, sh, bootTwice, finish, parseArgs } from '../lib/common.mjs';
+import { makeReport, sh, bootTwice, finish, parseArgs, bunMeetsHostFloor } from '../lib/common.mjs';
 
 const { opt, flag } = parseArgs(process.argv.slice(2));
 const LANE = opt('lane', 'published');
@@ -72,6 +74,12 @@ const S = (p) => p.replace('@animalabs/', '');
     return (r.stdout + r.stderr).trim().split('\n').slice(-3).join('\n');
   });
   if (!installOk) return done();
+
+  await step("bun meets the host's floor", () => {
+    const said = bunMeetsHostFloor(join(WORK, 'node_modules', '@animalabs', 'connectome-host', 'package.json'), report.bun);
+    log(said);
+    return said;
+  });
 
   await step('resolved versions + lag vs latest + nested copies', () => {
     for (const p of STACK) {

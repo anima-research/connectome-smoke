@@ -4,12 +4,17 @@ name: connectome smoke
 # repos' main branches laid out the way fleet boxes deploy them.
 #
 # Triggers
-#   schedule            every 30 min: poll the registry; run only when the set
-#                       of published versions changed since the last tested
-#                       set AND nothing was published in the last DEBOUNCE
-#                       minutes (a release usually cascades membrane → cm →
-#                       af → host over ~30-60 min; we test the settled set).
-#   workflow_dispatch   manual: runs unconditionally (pick lanes).
+#   schedule            every 30 min: poll the registry and the source mains;
+#                       run only when the published versions, the mains'
+#                       heads or this workflow's commit changed since the
+#                       last tested set AND nothing was published in the
+#                       last DEBOUNCE minutes (a release usually cascades
+#                       membrane → cm → af → host over ~30-60 min; we test
+#                       the settled set).
+#   workflow_dispatch   manual (pick lanes): with force set (the default) it
+#                       runs even when the set was tested or is settling;
+#                       without force it goes through the memory and the
+#                       debounce as a poll does.
 #   repository_dispatch type `npm-publish` — a publish workflow elsewhere can
 #                       poke us; treated like a poll tick (still debounced).
 
@@ -19,10 +24,19 @@ on:
   workflow_dispatch:
     inputs:
       lanes:
-        description: 'comma list: published,latest,source'
+        description: 'lanes to run'
+        type: choice
         default: 'published,latest,source'
+        options:
+          - published,latest,source
+          - published
+          - latest
+          - source
+          - published,latest
+          - published,source
+          - latest,source
       force:
-        description: 'run even if nothing changed'
+        description: 'run even if this set was tested or is settling'
         type: boolean
         default: true
   repository_dispatch:
@@ -37,6 +51,17 @@ concurrency:
 
 env:
   DEBOUNCE_MINUTES: '20'
+  # The runtimes every lane runs on, listed once here: the gate passes them
+  # to both lane jobs' matrices and to notify.mjs, which names any requested
+  # run whose summary never arrives. They are Node 22.12.0 and Bun 1.4.3,
+  # the highest floors the stack's packages declare, both pinned exactly;
+  # Node 24, the long-term-support line between the floor's major and the
+  # newest's, at its newest release when the run starts (check-latest); and
+  # the newest of each.
+  RUNTIMES: >-
+    [{"name": "floor", "node": "22.12.0", "bun": "1.4.3"},
+    {"name": "middle", "node": "24", "bun": "latest"},
+    {"name": "newest", "node": "latest", "bun": "latest"}]
 
 jobs:
   gate:
@@ -47,6 +72,12 @@ jobs:
       manifest: ${{ steps.decide.outputs.manifest }}
       reason: ${{ steps.decide.outputs.reason }}
       lanes: ${{ steps.decide.outputs.lanes }}
+      full: ${{ steps.decide.outputs.full }}
+      runtimes: ${{ steps.decide.outputs.runtimes }}
+      # The one key both ends use: the restore below and the save in the
+      # report job. Composing it twice from different ingredients is how the
+      # original restore/save mismatch happened.
+      testkey: ${{ steps.key.outputs.key }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -56,17 +87,42 @@ jobs:
         id: manifest
         run: |
           node scripts/manifest.mjs > manifest.json
-          echo "hash=$(sha256sum manifest.json | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          # The manifest's own `hash` field (version set only). Hashing the
+          # FILE here is the bug this replaced: manifest.json embeds
+          # `generatedAt`, so a file hash differs on every poll, the restore
+          # key below never matches the save key, and the gate re-runs the
+          # same set forever (observed: full suite every 30m for days, and
+          # one #alerts post per run once a lane went red).
+          echo "hash=$(node -p "require('./manifest.json').hash")" >> "$GITHUB_OUTPUT"
           cat manifest.json
-      # The cache is our "last tested set" memory: a hit on tested-<hash>
-      # means this exact set already ran. (Cache eviction just means one
-      # redundant run — acceptable.)
+      - name: Fingerprint source mains
+        id: heads
+        # The source lane's inputs are branch heads, not npm versions — fold
+        # them into the tested-key so a push to a stack repo's main (a fix OR
+        # a fresh breakage) retests promptly instead of waiting for the next
+        # npm publish to change the manifest.
+        run: echo "hash=$(node scripts/source-heads.mjs)" >> "$GITHUB_OUTPUT"
+      # The cache is our "last tested set" memory. Its key joins the
+      # published version set's hash, the source mains' fingerprint and the
+      # commit this workflow runs from, so a hit means this exact set already
+      # ran on every lane with this commit's lanes, scripts and runtime list,
+      # and a change to any of them is a set not yet tested. A runtime the
+      # list names by its line or as latest runs whatever that resolves to
+      # when the run starts, so a newer Node or Bun is tested with the next
+      # set, not on its own. Keys from before the commit joined it never
+      # match. (Cache eviction just means one redundant run — acceptable.)
+      - name: Compose the tested-set key
+        id: key
+        env:
+          SET: ${{ steps.manifest.outputs.hash }}
+          HEADS: ${{ steps.heads.outputs.hash }}
+        run: echo "key=tested-$SET-$HEADS-$GITHUB_SHA" >> "$GITHUB_OUTPUT"
       - name: Look up whether this set was already tested
         id: tested
         uses: actions/cache/restore@v4
         with:
           path: tested.marker
-          key: tested-${{ steps.manifest.outputs.hash }}
+          key: ${{ steps.key.outputs.key }}
           lookup-only: true
       - name: Decide
         id: decide
@@ -77,10 +133,17 @@ jobs:
           HIT: ${{ steps.tested.outputs.cache-hit }}
         run: |
           set -e
-          manifest=$(cat manifest.json | tr -d '\n')
-          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+          manifest=$(tr -d '\n' < manifest.json)
+          # The dispatch input is a choice, so lanes is always a comma list
+          # of lane names in this order, and full says it's all of them.
           lanes="${LANES_IN:-published,latest,source}"
-          echo "lanes=$lanes" >> "$GITHUB_OUTPUT"
+          if [ "$lanes" = "published,latest,source" ]; then full=true; else full=false; fi
+          {
+            echo "manifest=$manifest"
+            echo "lanes=$lanes"
+            echo "full=$full"
+            echo "runtimes=$RUNTIMES"
+          } >> "$GITHUB_OUTPUT"
           newest_age=$(node -e "const m=require('./manifest.json');const t=Math.max(...Object.values(m.packages).map(p=>Date.parse(p.modified)));console.log(Math.floor((Date.now()-t)/60000))")
           if [ "$EVENT" = "workflow_dispatch" ] && [ "$FORCE" != "false" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"; echo "reason=manual" >> "$GITHUB_OUTPUT"; exit 0
@@ -91,13 +154,14 @@ jobs:
           if [ "$newest_age" -lt "$DEBOUNCE_MINUTES" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"; echo "reason=settling: newest publish ${newest_age}m ago (< ${DEBOUNCE_MINUTES}m)" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          echo "run=true" >> "$GITHUB_OUTPUT"; echo "reason=new published set (newest publish ${newest_age}m ago)" >> "$GITHUB_OUTPUT"
+          echo "run=true" >> "$GITHUB_OUTPUT"; echo "reason=untested set: published versions, source mains or this workflow's commit changed (newest publish ${newest_age}m ago)" >> "$GITHUB_OUTPUT"
       - name: Summary
         run: |
           echo "decision run=${{ steps.decide.outputs.run }} — ${{ steps.decide.outputs.reason }}"
 
+  # Each lane runs once per runtime in env.RUNTIMES.
   published:
-    name: Published lane (${{ matrix.lane }})
+    name: Published lane (${{ matrix.lane }}, Node ${{ matrix.runtime.node }}, Bun ${{ matrix.runtime.bun }})
     needs: gate
     if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
@@ -105,60 +169,81 @@ jobs:
       fail-fast: false
       matrix:
         lane: [published, latest]
+        runtime: ${{ fromJSON(needs.gate.outputs.runtimes) }}
+    env:
+      LEG: ${{ matrix.lane }}-${{ matrix.runtime.name }}
+    # A leg for a lane the run didn't request runs no step, so it can't fail
+    # the job.
     steps:
       - uses: actions/checkout@v4
+        if: contains(needs.gate.outputs.lanes, matrix.lane)
       - uses: actions/setup-node@v4
+        if: contains(needs.gate.outputs.lanes, matrix.lane)
         with:
-          node-version: 22
+          node-version: ${{ matrix.runtime.node }}
+          check-latest: true
       - uses: oven-sh/setup-bun@v2
+        if: contains(needs.gate.outputs.lanes, matrix.lane)
         with:
-          bun-version: 1.3.14
+          bun-version: ${{ matrix.runtime.bun }}
+      # The work directory is named for the lane alone. A failing line can
+      # carry it, and the post shares a line every runtime's run has, so a
+      # name with the runtime would turn one failure into three lines. Each
+      # leg has a runner of its own, so the name needn't tell them apart.
       - name: Run lane
         if: contains(needs.gate.outputs.lanes, matrix.lane)
-        run: node lanes/published.mjs --lane ${{ matrix.lane }} --workdir "$RUNNER_TEMP/smoke-${{ matrix.lane }}" --report "$PWD/report-${{ matrix.lane }}.json" --summary "$PWD/summary-${{ matrix.lane }}.md" --keep
+        run: node lanes/published.mjs --lane ${{ matrix.lane }} --workdir "$RUNNER_TEMP/smoke-${{ matrix.lane }}" --report "$PWD/report-$LEG.json" --summary "$PWD/summary-$LEG.md" --keep
       - name: Job summary
         if: always() && contains(needs.gate.outputs.lanes, matrix.lane)
-        run: cat "summary-${{ matrix.lane }}.md" >> "$GITHUB_STEP_SUMMARY" || true
+        run: cat "summary-$LEG.md" >> "$GITHUB_STEP_SUMMARY" || true
       - name: Upload evidence
         if: always() && contains(needs.gate.outputs.lanes, matrix.lane)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.lane }}-evidence
+          name: ${{ env.LEG }}-evidence
           if-no-files-found: ignore
           path: |
-            report-${{ matrix.lane }}.json
-            summary-${{ matrix.lane }}.md
+            report-${{ env.LEG }}.json
+            summary-${{ env.LEG }}.md
             ${{ runner.temp }}/smoke-${{ matrix.lane }}/*.log
             ${{ runner.temp }}/smoke-${{ matrix.lane }}/*.events.jsonl
             ${{ runner.temp }}/smoke-${{ matrix.lane }}/data/**/*.log
 
   source:
-    name: Source-main lane
+    name: Source-main lane (Node ${{ matrix.runtime.node }}, Bun ${{ matrix.runtime.bun }})
     needs: gate
     if: needs.gate.outputs.run == 'true' && contains(needs.gate.outputs.lanes, 'source')
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: ${{ fromJSON(needs.gate.outputs.runtimes) }}
+    env:
+      LEG: source-${{ matrix.runtime.name }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.runtime.node }}
+          check-latest: true
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.14
+          bun-version: ${{ matrix.runtime.bun }}
+      # Named for the lane alone, as in the published job.
       - name: Run lane
-        run: node lanes/source.mjs --workdir "$RUNNER_TEMP/smoke-source" --report "$PWD/report-source.json" --summary "$PWD/summary-source.md" --keep
+        run: node lanes/source.mjs --workdir "$RUNNER_TEMP/smoke-source" --report "$PWD/report-$LEG.json" --summary "$PWD/summary-$LEG.md" --keep
       - name: Job summary
         if: always()
-        run: cat summary-source.md >> "$GITHUB_STEP_SUMMARY" || true
+        run: cat "summary-$LEG.md" >> "$GITHUB_STEP_SUMMARY" || true
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: source-evidence
+          name: ${{ env.LEG }}-evidence
           if-no-files-found: ignore
           path: |
-            report-source.json
-            summary-source.md
+            report-${{ env.LEG }}.json
+            summary-${{ env.LEG }}.md
             ${{ runner.temp }}/smoke-source/*.log
             ${{ runner.temp }}/smoke-source/*.events.jsonl
 
@@ -175,22 +260,53 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: evidence
+      # The post runs whatever came before it, so a failed download is still
+      # reported, with every run whose summary didn't arrive named.
       - name: Post to Discord
+        id: post
+        if: always()
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           REASON: ${{ needs.gate.outputs.reason }}
+          LANES: ${{ needs.gate.outputs.lanes }}
+          FULL: ${{ needs.gate.outputs.full }}
+          RUNTIMES: ${{ needs.gate.outputs.runtimes }}
           RESULT_PUBLISHED: ${{ needs.published.result }}
           RESULT_SOURCE: ${{ needs.source.result }}
         run: node scripts/notify.mjs evidence
-      # Remember this set as tested only when every requested lane actually
-      # ran to completion (pass OR fail — a failed set is still "tested"; a
-      # cancelled/errored run is not, so the next poll retries it).
+      # Remember this set as tested when notify.mjs says so, in its remember
+      # output: a run of every lane had a result from every requested run, a
+      # summary passing or failing, and the post went out; or the post would
+      # only say all is well and can't go out until someone acts (no
+      # webhook, or a refusal the next poll would meet too). A post that
+      # reports a failure and didn't go out, a post that didn't go out for a
+      # passing reason, a run whose summary never reached the report (cut
+      # off or cancelled before it wrote one, a setup step that failed, or
+      # its evidence not uploaded or downloaded), a run of some lanes, and a
+      # report that stopped before the post settled all leave the set to the
+      # next poll, which can do better, unless an earlier run remembered it:
+      # a cache entry can't be replaced, and this workflow can't delete one,
+      # so a forced manual run of a remembered set leaves it remembered. A
+      # lane job that ends other than in success after its runs' summaries
+      # arrived turns the post red, but leaves no run without a result. So a
+      # fault that stops a run every time reruns every lane and posts at
+      # each poll, naming that run, until it's fixed.
       - name: Mark set as tested
-        if: needs.published.result != 'cancelled' && needs.source.result != 'cancelled'
-        run: echo "${{ needs.gate.outputs.manifest }}" > tested.marker
+        id: mark
+        if: always() && steps.post.outputs.remember == 'true'
+        env:
+          MANIFEST: ${{ needs.gate.outputs.manifest }}
+        run: printf '%s\n' "$MANIFEST" > tested.marker
+      # Best-effort: a save that fails doesn't fail the run, so the set runs
+      # and posts again at the next poll. Saving a key that's already there
+      # only warns, which a forced run of a remembered set relies on.
       - uses: actions/cache/save@v4
-        if: needs.published.result != 'cancelled' && needs.source.result != 'cancelled'
+        if: always() && steps.mark.outcome == 'success'
         with:
           path: tested.marker
-          key: tested-${{ fromJSON(needs.gate.outputs.manifest).hash }}
+          # Must byte-match the gate's restore key — gate.outputs.testkey is
+          # that key. (The old `fromJSON(manifest).hash` was the version-set
+          # hash while restore hashed the manifest FILE, timestamp included:
+          # keys never matched, every poll re-ran and re-alerted.)
+          key: ${{ needs.gate.outputs.testkey }}
