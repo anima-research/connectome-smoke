@@ -21,7 +21,7 @@
 import { mkdtempSync, mkdirSync, existsSync, rmSync, symlinkSync, readdirSync, readFileSync, lstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { makeReport, sh, bootTwice, finish, parseArgs, failureLines, bunMeetsHostFloor } from '../lib/common.mjs';
+import { makeReport, sh, bootTwice, finish, parseArgs, failureMessage, bunMeetsHostFloor } from '../lib/common.mjs';
 import { REPOS, repoUrl } from '../lib/repos.mjs';
 
 const { opt } = parseArgs(process.argv.slice(2));
@@ -39,13 +39,12 @@ const { report, step, log, t0 } = makeReport('source', { workdir: WORK, heads: {
 
 function pkgJson(dir) { return JSON.parse(readFileSync(join(dir, 'package.json'), 'utf-8')); }
 function hasScript(dir, name) { return !!pkgJson(dir).scripts?.[name]; }
-function run(dir, cmdline, timeout = 900_000) {
+function run(dir, cmdline, timeout = 900_000, testOutput = false) {
   const [cmd, ...a] = cmdline.split(' ');
   const r = sh(cmd, a, { cwd: dir, timeout, allowFail: true, env: { CI: '1', FORCE_COLOR: '0' } });
   if (r.status !== 0) {
     const out = (r.stdout + '\n' + r.stderr).trim().split('\n');
-    const interesting = failureLines(out);
-    throw new Error(`\`${cmdline}\` in ${dir.replace(WORK, '.')} exited ${r.status}${r.signal ? ' ' + r.signal : ''}\n${(interesting.length ? interesting : out.slice(-30)).join('\n')}`);
+    throw new Error(failureMessage(`\`${cmdline}\` in ${dir.replace(WORK, '.')} exited ${r.status}${r.signal ? ' ' + r.signal : ''}`, out, testOutput));
   }
   return r;
 }
@@ -104,7 +103,7 @@ function testSummary(r) {
         await step(`${label}: typecheck`, () => { run(dir, 'npm run typecheck'); return 'clean'; });
       }
       if (r.test !== false && (r.test || hasScript(dir, 'test'))) {
-        await step(`${label}: test`, () => testSummary(run(dir, r.test ?? 'npm test', 1_200_000)));
+        await step(`${label}: test`, () => testSummary(run(dir, r.test ?? 'npm test', 1_200_000, true)));
       }
     }
   }
